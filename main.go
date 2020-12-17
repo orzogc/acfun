@@ -20,10 +20,11 @@ import (
 )
 
 var (
-	token = flag.String("token", "", "Your User Token (a.k.a acPasstoken)")
-	uid   = flag.String("uid", "", "Your User ID (a.k.a auth_key)")
-	debug = flag.Bool("verbose", false, "Verbose Mode")
-	auth  string
+	token  = flag.String("token", "", "Your User Token (a.k.a acPasstoken)")
+	uid    = flag.String("uid", "", "Your User ID (a.k.a auth_key)")
+	debug  = flag.Bool("verbose", false, "Verbose Mode")
+	auth   string
+	client = http.Client{Timeout: 10 * time.Second}
 )
 
 const (
@@ -160,7 +161,6 @@ func uploader(token string, partSize int, fileSize int64, ch *chan *UploadPart, 
 		if *debug {
 			log.Printf("part %d start uploading", item.count)
 		}
-		client := http.Client{Timeout: 10 * time.Second}
 		data := new(bytes.Buffer)
 		data.Write(item.content)
 		postURL := fmt.Sprintf("%s?upload_token=%s&fragment_id=%d", UploadEndpoint, token, item.count)
@@ -174,18 +174,18 @@ func uploader(token string, partSize int, fileSize int64, ch *chan *UploadPart, 
 		}
 		resp, err := client.Do(req)
 		if err != nil {
-			if *debug {
-				log.Printf("failed uploading part %d error: %v (retring)", item.count, err)
-			}
-			*ch <- item
+			log.Printf("failed uploading part %d error: %v (retring)", item.count, err)
+			go func() {
+				*ch <- item
+			}()
 			continue
 		}
 		body, err := ioutil.ReadAll(resp.Body)
 		if err != nil {
-			if *debug {
-				log.Printf("failed reading upload part %d response error: %v (retring)", item.count, err)
-			}
-			*ch <- item
+			log.Printf("failed reading upload part %d response error: %v (retring)", item.count, err)
+			go func() {
+				*ch <- item
+			}()
 			_ = resp.Body.Close()
 			continue
 		}
@@ -195,18 +195,18 @@ func uploader(token string, partSize int, fileSize int64, ch *chan *UploadPart, 
 		result := new(UploadPartResult)
 		err = json.Unmarshal(body, result)
 		if err != nil {
-			if *debug {
-				log.Printf("failed unmarshaling upload part %d response to json error: %v (retring)", item.count, err)
-			}
-			*ch <- item
+			log.Printf("failed unmarshaling upload part %d response to json error: %v (retring)", item.count, err)
+			go func() {
+				*ch <- item
+			}()
 			_ = resp.Body.Close()
 			continue
 		}
 		if result.Result != 1 || result.Size != int64(len(item.content)) {
-			if *debug {
-				log.Printf("failed uploading part %d response: %+v (retring)", item.count, *result)
-			}
-			*ch <- item
+			log.Printf("failed uploading part %d response: %+v (retring)", item.count, *result)
+			go func() {
+				*ch <- item
+			}()
 			_ = resp.Body.Close()
 			continue
 		}
@@ -288,7 +288,6 @@ func request(link string, postBody string) ([]byte, error) {
 		log.Printf("postBody: %v", postBody)
 		log.Printf("endpoint: %s", link)
 	}
-	client := http.Client{Timeout: 10 * time.Second}
 	req, err := http.NewRequest("POST", link, strings.NewReader(postBody))
 	if err != nil {
 		if *debug {
@@ -338,7 +337,6 @@ func getFileInfo(path string) (os.FileInfo, error) {
 }
 
 func uploadRequest(method string, link string) error {
-	client := http.Client{Timeout: 10 * time.Second}
 	req, err := http.NewRequest(method, link, nil)
 	if err != nil {
 		if *debug {
@@ -354,13 +352,11 @@ func uploadRequest(method string, link string) error {
 		return err
 	}
 	defer resp.Body.Close()
-	if *debug {
-		body, err := ioutil.ReadAll(resp.Body)
-		if err != nil {
-			log.Printf("read response of upload request returns err: %v", err)
-			return err
-		}
-		log.Printf("upload request response: %s", string(body))
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("read response of upload request returns err: %v", err)
+		return err
 	}
+	log.Printf("upload request response: %s", string(body))
 	return nil
 }
