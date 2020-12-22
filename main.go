@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"crypto/md5"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -114,7 +116,7 @@ func main() {
 		wg := new(sync.WaitGroup)
 		ch := make(chan *UploadPart)
 		for i := 0; i < config.Config.Parallel; i++ {
-			go uploader(config.Token, config.Config.PartSize-1, info.Size(), &ch, wg, bar)
+			go uploader(config.Token, config.Config.PartSize-1, info.Size(), ch, wg, bar)
 		}
 
 		part := int64(-1)
@@ -156,15 +158,28 @@ func printUsage() {
 	flag.PrintDefaults()
 }
 
-func uploader(token string, partSize int, fileSize int64, ch *chan *UploadPart, wg *sync.WaitGroup, bar *pb.ProgressBar) {
-	for item := range *ch {
+func uploader(token string, partSize int, fileSize int64, ch chan *UploadPart, wg *sync.WaitGroup, bar *pb.ProgressBar) {
+Loop:
+	for item := range ch {
 		if *debug {
 			log.Printf("part %d start uploading", item.count)
 		}
+		var md5Hash string
+		var md5Wg sync.WaitGroup
+		md5Wg.Add(1)
+		go func() {
+			defer md5Wg.Done()
+			sum := md5.Sum(item.content)
+			md5Hash = hex.EncodeToString(sum[:])
+		}()
 		data := new(bytes.Buffer)
 		data.Write(item.content)
 		postURL := fmt.Sprintf("%s?upload_token=%s&fragment_id=%d", UploadEndpoint, token, item.count)
 		req, err := http.NewRequest("POST", postURL, data)
+		if err != nil {
+			ch <- item
+			continue
+		}
 		req.Header.Set("Content-Type", "application/octet-stream")
 		start := item.count * int64(partSize)
 		contentRange := fmt.Sprintf("bytes %d-%d/%d", start, start+int64(len(item.content))-1, fileSize)
@@ -172,48 +187,52 @@ func uploader(token string, partSize int, fileSize int64, ch *chan *UploadPart, 
 		if *debug {
 			log.Println(req.Header)
 		}
-		resp, err := client.Do(req)
-		if err != nil {
-			log.Printf("failed uploading part %d error: %v (retring)", item.count, err)
-			go func() {
-				*ch <- item
-			}()
-			continue
+		for i := 0; i < 3; i++ {
+			checksum, err := upload(req, item.count, len(item.content))
+			md5Wg.Wait()
+			if err != nil || md5Hash != checksum {
+				if i == 2 {
+					ch <- item
+					continue Loop
+				}
+				if err != nil {
+					log.Printf("%v", err)
+				} else {
+					log.Printf("part %d checksum is wrong: %s, %s", item.count, md5Hash, checksum)
+				}
+				continue
+			}
+			break
 		}
-		body, err := ioutil.ReadAll(resp.Body)
-		if err != nil {
-			log.Printf("failed reading upload part %d response error: %v (retring)", item.count, err)
-			go func() {
-				*ch <- item
-			}()
-			_ = resp.Body.Close()
-			continue
-		}
-		if *debug {
-			log.Printf("upload part %d finished. Result: %s", item.count, string(body))
-		}
-		result := new(UploadPartResult)
-		err = json.Unmarshal(body, result)
-		if err != nil {
-			log.Printf("failed unmarshaling upload part %d response to json error: %v (retring)", item.count, err)
-			go func() {
-				*ch <- item
-			}()
-			_ = resp.Body.Close()
-			continue
-		}
-		if result.Result != 1 || result.Size != int64(len(item.content)) {
-			log.Printf("failed uploading part %d response: %+v (retring)", item.count, *result)
-			go func() {
-				*ch <- item
-			}()
-			_ = resp.Body.Close()
-			continue
-		}
-		_ = resp.Body.Close()
+
 		bar.Add(len(item.content))
 		wg.Done()
 	}
+}
+
+func upload(req *http.Request, count int64, length int) (string, error) {
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed uploading part %d error: %v (retring)", count, err)
+	}
+	defer resp.Body.Close()
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed reading upload part %d response error: %v (retring)", count, err)
+	}
+	if *debug {
+		log.Printf("upload part %d finished. Result: %s", count, string(body))
+	}
+	result := new(UploadPartResult)
+	err = json.Unmarshal(body, result)
+	if err != nil {
+		return "", fmt.Errorf("failed unmarshaling upload part %d response to json error: %v (retring)", count, err)
+	}
+	if result.Result != 1 || result.Size != int64(length) {
+		return "", fmt.Errorf("failed uploading part %d response: %+v (retring)", count, *result)
+	}
+
+	return result.Checksum, nil
 }
 
 func finishUpload(token string, part int64, task string, filename string) error {
