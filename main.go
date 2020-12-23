@@ -159,7 +159,6 @@ func printUsage() {
 }
 
 func uploader(token string, partSize int, fileSize int64, ch chan *UploadPart, wg *sync.WaitGroup, bar *pb.ProgressBar) {
-Loop:
 	for item := range ch {
 		if *debug {
 			log.Printf("part %d start uploading", item.count)
@@ -172,34 +171,31 @@ Loop:
 			sum := md5.Sum(item.content)
 			md5Hash = hex.EncodeToString(sum[:])
 		}()
-		data := new(bytes.Buffer)
-		data.Write(item.content)
 		postURL := fmt.Sprintf("%s?upload_token=%s&fragment_id=%d", UploadEndpoint, token, item.count)
-		req, err := http.NewRequest("POST", postURL, data)
-		if err != nil {
-			ch <- item
-			continue
-		}
-		req.Header.Set("Content-Type", "application/octet-stream")
 		start := item.count * int64(partSize)
 		contentRange := fmt.Sprintf("bytes %d-%d/%d", start, start+int64(len(item.content))-1, fileSize)
-		req.Header.Set("Content-Range", contentRange)
-		if *debug {
-			log.Println(req.Header)
-		}
-		for i := 0; i < 3; i++ {
+		for {
+			data := new(bytes.Buffer)
+			data.Write(item.content)
+			req, err := http.NewRequest("POST", postURL, data)
+			if err != nil {
+				continue
+			}
+			req.Header.Set("Content-Type", "application/octet-stream")
+			req.Header.Set("Content-Range", contentRange)
+			if *debug {
+				log.Println(req.Header)
+			}
 			checksum, err := upload(req, item.count, len(item.content))
 			md5Wg.Wait()
-			if err != nil || md5Hash != checksum {
-				if i == 2 {
-					ch <- item
-					continue Loop
-				}
-				if err != nil {
-					log.Printf("%v", err)
-				} else {
-					log.Printf("part %d checksum is wrong: %s, %s", item.count, md5Hash, checksum)
-				}
+			if err != nil {
+				log.Printf("%v", err)
+				time.Sleep(time.Second)
+				continue
+			}
+			if md5Hash != checksum {
+				log.Printf("part %d checksum is wrong: %s, %s", item.count, md5Hash, checksum)
+				time.Sleep(time.Second)
 				continue
 			}
 			break
